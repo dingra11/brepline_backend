@@ -48,6 +48,14 @@ def main():
         meta["bbox_min"] = [bb.xmin, bb.ymin, bb.zmin]
         if not solids:
             raise ValueError("result contains no solid")
+        try:  # extra analysis for the 3D info panel (never fatal)
+            meta["area"] = float(shape.Area())
+            c = shape.Center()
+            meta["com"] = [c.x, c.y, c.z]
+            meta["counts"] = {"solids": len(solids), "faces": len(shape.Faces()),
+                              "edges": len(shape.Edges()), "vertices": len(shape.Vertices())}
+        except Exception:
+            pass
 
         diag = math.sqrt(bb.xlen ** 2 + bb.ylen ** 2 + bb.zlen ** 2) or 1.0
         tol = max(0.05, diag / 500.0)
