@@ -154,3 +154,4 @@ async def health():
     return {"ok": True, "cadquery": cq_ok, "llm_configured": bool(os.getenv("LLM_BASE_URL")),
             "llm_model": os.getenv("LLM_MODEL", ""), "firebase": storage.FB_ON,
             "pipeline": cp.PIPELINE_VERSION, "queued": sum(1 for j in JOBS.values() if j["status"] in ("queued", "running"))}
+  
