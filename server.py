@@ -149,11 +149,8 @@ async def export(fmt: str = "messages", source: str = "local", min_score: int = 
 
 @app.get("/api/health")
 async def health():
-    try:
-        import cadquery  # noqa
-        cq_ok = True
-    except Exception:
-        cq_ok = False
+    import importlib.util  # find_spec: does not load OpenCascade (~400 MB) into the web process
+    cq_ok = importlib.util.find_spec("cadquery") is not None
     return {"ok": True, "cadquery": cq_ok, "llm_configured": bool(os.getenv("LLM_BASE_URL")),
             "llm_model": os.getenv("LLM_MODEL", ""), "firebase": storage.FB_ON,
             "pipeline": cp.PIPELINE_VERSION, "queued": sum(1 for j in JOBS.values() if j["status"] in ("queued", "running"))}
