@@ -38,6 +38,7 @@ the Dockerfile does); output files live on ephemeral disk (24 h TTL by default).
 cadpipe.py          pipeline (planner, retrieval, candidates, repair, scoring, persistence)
 runner.py           sandboxed subprocess: executes the script, tessellates, exports STEP/STL
 helpers.py          radial / bolt_circle / spur_gear available to generated code
+profiles.py         exact builders: drawn polygon (extrude) / half-section (revolve) -> CadQuery code + checks
 examples_lib.py     few-shot library (add more examples here = better results)
 storage.py          local JSONL + Firebase RTDB (REST, background queue, retry spool)
 server.py           FastAPI API
@@ -75,6 +76,8 @@ and storage is ephemeral, which is why training data goes to Firebase.
 | GET | `/api/file/{job}/{step\|stl\|py}` | downloads |
 | POST | `/api/feedback` | `{job, vote: up/down/none, comment?}` |
 | GET | `/api/export?fmt=messages&source=local` | header `X-Admin-Token` |
+| POST | `/api/shape` | `{spec, name?, material?, parent_job?}` -> `{job}` (poll `/api/jobs/{job}`). Builds a drawn polygon / revolve profile directly, no LLM |
+| POST | `/api/shape/validate` | `{spec}` -> `{ok, error?, bbox, volume_mm3}` instant check while drawing |
 | GET | `/api/health` | |
 
 `parent_job` makes the request an edit of that job's code ("make the hole bigger").
@@ -117,6 +120,36 @@ Keeps only verified (score 10), non-edit, not down-voted, de-duplicated by code 
 `python factory.py --per-category 20` has the LLM invent diverse requests across 10 categories and runs them
 through the pipeline. Then export, fine-tune on `messages.jsonl`, and benchmark against the API pipeline on a
 held-out prompt set before trusting it.
+
+## Using your own fine-tuned model (LLM_MODE=lmm)
+
+The adapter was trained on one fixed format, so the pipeline has a mode that matches it:
+
+1. **Planner** turns the plain-English request into a build spec
+   (`Create a CadQuery model with a bounding box of ... Steps: 1) new body: sketch on XY plane ...`).
+   Six worked examples live in `SPEC_SHOTS` in `cadpipe.py`. The adapter is switched off for this step.
+2. **Coder** gets the training system prompt + that spec, with the ```` ```python ```` fence pre-filled.
+3. Retries re-sample the same spec (the adapter never saw repair turns) and results are checked
+   against the spec's bounding box (5 % tolerance).
+
+`serve_model.py` must accept `prefill` and `adapter` fields (see the patch cells in the chat history / `serve_model_patch.py`).
+The stored `plan.spec` of every job is a ready-made (request -> spec) and (spec -> code) training pair.
+
+## Round parts, polygons and the "Verified" badge
+
+* **Routing (lmm mode, `ROUTE=1`, set `ROUTE=0` to disable).** A one-word classifier call (base model, adapter off) sends
+  *round parts whose radius changes* (rocket, vase, bottle, pulley...) to the **revolve** builder and *outline parts*
+  (L / T / U brackets, stars, hex nuts, any list of points) to the **polygon** builder. The planner only produces a small JSON
+  profile; `profiles.py` validates it (no self-crossing, holes inside, fins fused to the body) and writes the CadQuery code.
+  Everything else (washers, flanges, plates with holes...) still goes to your fine-tuned adapter. If the profile cannot be
+  made valid after 3 tries the request falls back to the adapter.
+* **Edits** of a polygon / revolve design re-plan the JSON ("make it twice as tall") instead of patching code.
+* **Custom polygons from the UI.** `frontend_integration/ShapeEditor.jsx` posts the user's own outline to `/api/shape`.
+  Spec format is documented at the top of `profiles.py`. The result's `plan.profile_spec` reopens in the same editor.
+* **What "Verified" means now.** Valid, single solid, AND measured against something: polygon / revolve builds are checked
+  against exact expected volume and size; adapter builds against the plan's bounding box. A plain box returned for a request
+  that does not mention a box is rejected, and `check_detail` says what was actually checked.
+  A "Verified" model is still only as right as the plan, so thumbs-down bad ones: they are excluded from training.
 
 ## Next steps (suggested order)
 

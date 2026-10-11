@@ -10,4 +10,4 @@ RUN chown -R user:user /home/user/app
 USER user
 ENV OUT_DIR=/tmp/cad_out DATA_DIR=/tmp/cad_data PYTHONUNBUFFERED=1
 EXPOSE 7860
-CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "7860"]
+CMD ["sh", "-c", "uvicorn server:app --host 0.0.0.0 --port ${PORT:-7860}"]

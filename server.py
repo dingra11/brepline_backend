@@ -6,6 +6,7 @@ from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 
 import cadpipe as cp
+import profiles
 import storage
 import export_training as et
 
@@ -29,6 +30,13 @@ class JobReq(BaseModel):
     material: str = "Al 6061"
     parent_job: str | None = None
     fresh: bool = False
+
+
+class ShapeReq(BaseModel):
+    spec: dict                              # {"type": "polygon" | "revolve", ...}  see profiles.py
+    name: str = Field(default="", max_length=120)
+    material: str = "Al 6061"
+    parent_job: str | None = None           # the design this was edited from (kept for training data)
 
 
 class VoteReq(BaseModel):
@@ -86,6 +94,55 @@ async def run_job(job, req: JobReq):
         except Exception as e:
             J["status"], J["error"] = "error", str(e)[:300]
             J["log"].append("error")
+
+
+async def run_shape_job(job, req: ShapeReq, label):
+    async with SEM:
+        J = JOBS[job]
+        J["status"] = "running"
+        try:
+            out, _ = await asyncio.to_thread(
+                cp.generate, label, None, req.material,
+                lambda m: J["log"].append(m), job, False, "polygon_ui", req.spec)
+            J["result"] = out
+            J["status"] = "done" if out.get("ok") else "error"
+            if not out.get("ok"):
+                J["error"] = out.get("error", "build failed")
+        except Exception as e:
+            J["status"], J["error"] = "error", str(e)[:300]
+            J["log"].append("error")
+
+
+@app.post("/api/shape/validate")
+async def validate_shape(body: ShapeReq, x_access_code: str | None = Header(None)):
+    """Pure-python check of a drawn polygon / profile (no CAD, no LLM, no rate limit)."""
+    if ACCESS_CODE and x_access_code != ACCESS_CODE:
+        raise HTTPException(401, "invalid access code")
+    try:
+        _, plan, spec = profiles.build(body.spec)
+    except profiles.SpecError as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "spec": spec, "bbox": plan.get("overall_size_mm"),
+            "volume_mm3": plan.get("expect_volume_mm3")}
+
+
+@app.post("/api/shape")
+async def create_shape(body: ShapeReq, request: Request, x_access_code: str | None = Header(None)):
+    """Build a solid straight from a user-drawn polygon (extrude) or half-section (revolve)."""
+    guard(request, x_access_code)
+    try:
+        spec = profiles.clean(body.spec)
+    except profiles.SpecError as e:
+        raise HTTPException(400, str(e))
+    if body.parent_job and not cp.valid_job(body.parent_job):
+        raise HTTPException(400, "bad parent_job")
+    gc()
+    label = (body.name.strip() or ("Custom polygon part" if spec["type"] == "polygon" else "Custom revolved part"))[:120]
+    job = uuid.uuid4().hex[:12]
+    JOBS[job] = {"status": "queued", "log": [], "t": time.time(), "result": None, "error": None}
+    req = body.model_copy(update={"spec": spec})
+    asyncio.create_task(run_shape_job(job, req, label))
+    return {"job": job}
 
 
 @app.post("/api/jobs")
@@ -154,4 +211,3 @@ async def health():
     return {"ok": True, "cadquery": cq_ok, "llm_configured": bool(os.getenv("LLM_BASE_URL")),
             "llm_model": os.getenv("LLM_MODEL", ""), "firebase": storage.FB_ON,
             "pipeline": cp.PIPELINE_VERSION, "queued": sum(1 for j in JOBS.values() if j["status"] in ("queued", "running"))}
-  

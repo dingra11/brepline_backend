@@ -4,7 +4,7 @@ prompt -> planner (JSON) -> retrieved few-shot examples -> N parallel candidates
 -> validation + sandboxed CadQuery run -> scoring -> repair loop -> best result.
 Every job is written to storage (generations / failures) for later training.
 """
-import os, re, ast, json, time, uuid, shutil, hashlib, subprocess, sys, threading
+import os, re, ast, json, math, time, uuid, shutil, hashlib, subprocess, sys, threading
 from concurrent.futures import ThreadPoolExecutor
 
 try:
@@ -13,13 +13,15 @@ except ImportError:  # pragma: no cover
     resource = None
 
 import storage
+import profiles
 from examples_lib import EXAMPLES
 
-PIPELINE_VERSION = "1.0"
+PIPELINE_VERSION = "1.1"
 HERE = os.path.dirname(os.path.abspath(__file__))
 RUNNER = os.path.join(HERE, "runner.py")
 OUT_DIR = os.getenv("OUT_DIR", "/tmp/cad_out")
 N_CAND = int(os.getenv("N_CAND", "3"))
+ROUTE = os.getenv("ROUTE", "1") != "0"   # lmm mode: send round / polygon parts to the profile builders
 REPAIRS = int(os.getenv("REPAIRS", "2"))
 CAD_WORKERS = int(os.getenv("CAD_WORKERS", "2"))
 CAD_TIMEOUT = int(os.getenv("CAD_TIMEOUT", "90"))
@@ -297,6 +299,17 @@ def hint(error):
     return ""
 
 
+BOX_WORDS = re.compile(r"\b(block|cube|box|brick|slab|plate|bar|cuboid|square|rectang\w*|prism|beam|tile|"
+                       r"panel|sheet|stock|plank|board|dice|die|crate|case|enclosure|housing|spacer|pad|shim|billet)\b", re.I)
+
+
+def is_plain_box(meta):
+    c = meta.get("counts") or {}
+    bb = meta.get("bbox") or [0, 0, 0]
+    bv = bb[0] * bb[1] * bb[2]
+    return c.get("faces") == 6 and bv > 0 and meta.get("volume", 0) / bv > 0.99
+
+
 def evaluate(meta, plan):
     """Return (score 0-10, issues list, size_checked)."""
     if not meta.get("ok"):
@@ -320,6 +333,22 @@ def evaluate(meta, plan):
         if any(abs(g - w) / w > tol for g, w in zip(got, want)):
             score -= 3
             issues.append(f"overall size {[round(x, 1) for x in got]} mm differs from expected {want} mm")
+    ev = plan.get("expect_volume_mm3")
+    if isinstance(ev, (int, float)) and ev > 0:      # exact for polygon / revolve builds
+        size_checked = True
+        if abs(meta["volume"] - ev) / ev > 0.02:
+            score -= 3
+            issues.append(f"volume {meta['volume']:.0f} mm3 differs from the expected {ev:.0f} mm3")
+    eh = plan.get("expect_height_mm")
+    if isinstance(eh, (int, float)) and eh > 0 and len(meta.get("bbox", [])) == 3:
+        size_checked = True
+        if abs(meta["bbox"][2] - eh) / eh > 0.05:
+            score -= 3
+            issues.append(f"height {meta['bbox'][2]:.1f} mm differs from the expected {eh:.1f} mm")
+    if plan.get("allow_box") is False and is_plain_box(meta):
+        score -= 4
+        issues.append("result is a plain box, but the request does not describe a box; "
+                      "the shape was probably not understood")
     return max(score, 0), issues, size_checked
 
 
@@ -352,6 +381,103 @@ def make_spec_plan(prompt, parent_prompt=None):
             size = [float(g) for g in m.groups()] if m else None
             return {"object": req[:60], "assembly": False, "overall_size_mm": size, "spec": spec}
     return {"error": err or "planner produced no valid build spec"}
+
+
+# ---- routing: round parts -> revolve builder, outline parts -> polygon builder
+ROUTE_SYS = """Classify a CAD request by how the part is best built. Answer with exactly one word.
+REVOLVE = a round part whose radius changes along its axis (lathe-turned / spun shape): rocket, vase, bottle, goblet, glass, bell, cone, funnel, chess piece, knob, pulley with a groove, bullet, dome, lamp base, candle holder.
+POLYGON = a flat part cut from an outline that is not a plain rectangle or circle: star, hexagon or pentagon plate, hex nut, arrow, L / T / U / Z shaped bracket or plate, gusset, triangle, or any shape given as a list of points.
+PRISM = everything else: block, plate with holes, washer, ring, tube, flange, spacer, plain cylinder, stepped shaft, box with pockets."""
+ROUTE_SHOTS = [("make a rocket", "REVOLVE"), ("washer, 16 mm outer, 8 mm inner, 2 mm thick", "PRISM"),
+               ("L bracket 60 x 40 mm", "POLYGON"), ("plate 100 x 60 x 8 with four corner holes", "PRISM"),
+               ("a vase 120 mm tall", "REVOLVE"), ("6 point star, 50 mm", "POLYGON")]
+
+
+def route_kind(req):
+    msgs = [{"role": "system", "content": ROUTE_SYS}]
+    for q, a in ROUTE_SHOTS:
+        msgs += [{"role": "user", "content": q}, {"role": "assistant", "content": a}]
+    msgs.append({"role": "user", "content": req})
+    try:
+        t = llm(msgs, 0.0, 6, planner=True).upper()
+    except Exception:
+        return "PRISM"
+    m = re.search(r"REVOLVE|POLYGON|PRISM", t)
+    return m.group(0) if m else "PRISM"
+
+
+def _star(n, ro, ri):
+    pts = []
+    for i in range(2 * n):
+        r, a = (ro if i % 2 == 0 else ri), math.pi / 2 + i * math.pi / n
+        pts.append([round(r * math.cos(a), 1), round(r * math.sin(a), 1)])
+    return pts
+
+
+def _jd(o):
+    return json.dumps(o, separators=(",", ":"))
+
+
+_PROFILE_RULES = """Reply with ONE JSON object and nothing else. Millimetres. Pick realistic dimensions when the request gives none.
+"""
+PROFILE_SYS = {
+    "REVOLVE": _PROFILE_RULES + """The part is spun 360 degrees around the Z axis. Give its half-section as
+"profile": a CLOSED outline of [radius, height] points, radius >= 0, going up the outside and back down the inside
+(a solid part comes back along the axis at radius 0; a hollow part has an inner wall). The outline must not cross itself.
+Use 8-20 points; shape curves (nose cones, bowls, bells) with several points.
+Optional "radial": fins / ribs, each {"count": n, "polygon": [[radius, height], ...], "thickness": t}; the polygon is the
+side view of one fin, its inner edge may sit on the body surface (it is sunk into the body automatically).""",
+    "POLYGON": _PROFILE_RULES + """The part is a flat outline extruded upward. Give "points": the outline as [x, y] points in order
+(any direction, no repeated first point, must not cross itself), centred or starting at the origin, plus "thickness".
+Optional "holes": [{"x":..,"y":..,"d":..}] round through-holes (inside the outline, at least d/2 + 1 mm from every edge) and
+"cutouts": [[[x,y],...],...] polygonal windows fully inside the outline.""",
+}
+PROFILE_SHOTS = {
+    "REVOLVE": [
+        ("make a rocket", _jd({"type": "revolve",
+         "profile": [[0, 0], [9, 0], [12, 12], [20, 22], [20, 140], [19.2, 152], [17.2, 166], [13.8, 180], [8.8, 192], [0, 200]],
+         "radial": [{"count": 4, "polygon": [[20, 60], [20, 15], [42, 0], [42, 22]], "thickness": 2}]})),
+        ("wine glass 70 mm wide and 150 mm tall", _jd({"type": "revolve",
+         "profile": [[0, 0], [30, 0], [30, 3], [4, 6], [4, 70], [12, 76], [30, 90], [35, 115], [33, 150],
+                     [31, 150], [32, 115], [27, 92], [10, 80], [0, 78]]})),
+        ("pulley 60 mm diameter, 20 mm wide, V groove, 10 mm bore", _jd({"type": "revolve",
+         "profile": [[5, 0], [30, 0], [30, 6], [26, 10], [30, 14], [30, 20], [5, 20]]})),
+    ],
+    "POLYGON": [
+        ("L bracket 60 x 40 mm, 10 mm wide legs, 5 mm thick, two 5 mm holes", _jd({"type": "polygon",
+         "points": [[0, 0], [60, 0], [60, 10], [10, 10], [10, 40], [0, 40]], "thickness": 5,
+         "holes": [{"x": 50, "y": 5, "d": 5}, {"x": 5, "y": 30, "d": 5}]})),
+        ("hex nut M8, 13 mm across flats, 6.5 mm thick", _jd({"type": "polygon",
+         "points": [[7.5, 0], [3.8, 6.5], [-3.8, 6.5], [-7.5, 0], [-3.8, -6.5], [3.8, -6.5]], "thickness": 6.5,
+         "holes": [{"x": 0, "y": 0, "d": 6.8}]})),
+        ("5 point star plate, 60 mm across, 4 mm thick", _jd({"type": "polygon", "points": _star(5, 30, 12),
+                                                                "thickness": 4})),
+    ],
+}
+
+
+def make_profile_plan(req, kind, parent_spec=None):
+    """Planner -> validated profile spec -> (code, plan) for the deterministic builders, or (None, error)."""
+    msgs = [{"role": "system", "content": PROFILE_SYS[kind]}]
+    for q, a in PROFILE_SHOTS[kind]:
+        msgs += [{"role": "user", "content": q}, {"role": "assistant", "content": a}]
+    msgs.append({"role": "user", "content": req if not parent_spec else
+                 f"Current shape: {_jd(parent_spec)}\nChange: {req}\nReturn the complete new shape."})
+    err = ""
+    for temp in (0.1, 0.2, 0.4):
+        try:
+            raw = llm(msgs, temp, 900, planner=True)
+            spec = extract_json(raw)
+            spec["type"] = kind.lower()
+            code, plan, _ = profiles.build(spec)
+            return code, plan
+        except profiles.SpecError as e:
+            err = str(e)
+            msgs = msgs[:len(msgs)] + [{"role": "assistant", "content": raw},
+                                       {"role": "user", "content": f"That shape is invalid: {err}. Return the corrected JSON."}]
+        except Exception as e:
+            err = str(e)
+    return None, err
 
 
 def lmm_msgs(spec):
@@ -421,6 +547,12 @@ def _attempt(msgs, wd, plan, temp):
         res["issues"] = ["no code block in reply"]
         res["stage"] = "extract"
         return res
+    return _run_code(code, wd, plan, res)
+
+
+def _run_code(code, wd, plan, res=None):
+    res = res or {"code": code, "score": 0, "issues": [], "meta": {}, "stage": "run", "size_checked": False}
+    res["code"] = code
     ok, err = validate_code(code)
     if not ok:
         res.update(issues=[err], stage="validate")
@@ -435,8 +567,9 @@ def _attempt(msgs, wd, plan, temp):
 # ------------------------------------------------------------------ main entry
 
 def generate(prompt, parent=None, material="Al 6061", log=None, job=None,
-             fresh=False, source="user"):
-    """Returns (out, record). `out` is what the API returns; `record` was saved for training."""
+             fresh=False, source="user", spec=None):
+    """Returns (out, record). `out` is what the API returns; `record` was saved for training.
+    spec = a polygon / revolve profile from the editor: built directly, no LLM involved."""
     log = log or (lambda m: None)
     t0 = time.time()
     job = job or uuid.uuid4().hex[:12]
@@ -447,7 +580,8 @@ def generate(prompt, parent=None, material="Al 6061", log=None, job=None,
             parent_code = open(pp).read()
     material = material if material in DENSITY else "Al 6061"
 
-    key = hashlib.sha256(f"{prompt}|{material}|{hash_str(parent_code)}".encode()).hexdigest()[:24]
+    key = hashlib.sha256(f"{prompt}|{material}|{hash_str(parent_code)}|"
+                         f"{json.dumps(spec, sort_keys=True) if spec else ''}".encode()).hexdigest()[:24]
     cpath = os.path.join(OUT_DIR, f"cache_{key}.txt")
     if not fresh and os.path.exists(cpath):
         hit = load_out(open(cpath).read().strip())
@@ -456,31 +590,59 @@ def generate(prompt, parent=None, material="Al 6061", log=None, job=None,
             hit["cached"] = True
             return hit, None
 
-    log("planning")
-    if LLM_MODE == "lmm":
-        parent_prompt = None
-        if parent_code:
-            try:
-                parent_prompt = json.load(open(os.path.join(job_dir(parent), "out.json"))).get("prompt")
-            except Exception:
-                pass
-        plan = make_spec_plan(prompt, parent_prompt)
-        examples = []
-        msgs = lmm_msgs(plan["spec"]) if plan.get("spec") else None
+    direct, route, examples, msgs, plan = None, "prism", [], None, {}
+    if spec is not None:                                   # user-drawn profile: no LLM at all
+        route = str(spec.get("type", "polygon")) if isinstance(spec, dict) else "polygon"
+        try:
+            code, plan, _ = profiles.build(spec)
+            direct = {"code": code}
+        except profiles.SpecError as e:
+            plan = {"error": str(e)}
     else:
-        plan = make_plan(prompt, parent_code)
-        examples = pick_examples(prompt)
-        msgs = base_msgs(prompt, plan, examples, parent_code)
+        log("planning")
+        if LLM_MODE == "lmm":
+            parent_prompt, parent_plan = None, {}
+            if parent_code:
+                try:
+                    po = json.load(open(os.path.join(job_dir(parent), "out.json")))
+                    parent_prompt, parent_plan = po.get("prompt"), po.get("plan") or {}
+                except Exception:
+                    pass
+            req = prompt if not parent_prompt else f"{parent_prompt}. Change: {prompt}"
+            pspec = parent_plan.get("profile_spec") if isinstance(parent_plan, dict) else None
+            kind = (pspec or {}).get("type", "").upper() if pspec else ("PRISM" if parent_code else
+                                                                      (route_kind(req) if ROUTE else "PRISM"))
+            if kind in ("REVOLVE", "POLYGON"):
+                log(f"building {kind.lower()} profile")
+                code, p2 = make_profile_plan(prompt if pspec else req, kind, pspec)
+                if code:
+                    direct, plan, route = {"code": code}, p2, kind.lower()
+                else:
+                    log(f"profile failed ({str(p2)[:80]}), using the extrusion model")
+            if not direct:
+                plan = make_spec_plan(prompt, parent_prompt)
+                msgs = lmm_msgs(plan["spec"]) if plan.get("spec") else None
+        else:
+            plan = make_plan(prompt, parent_code)
+            examples = pick_examples(prompt)
+            msgs = base_msgs(prompt, plan, examples, parent_code)
+        if isinstance(plan, dict) and not direct:
+            plan["allow_box"] = bool(BOX_WORDS.search(prompt))
 
-    log(f"generating {N_CAND} candidates")
     wd = job_dir(job)
     os.makedirs(wd, exist_ok=True)
-    temps = ([0.1] + [0.5] * (N_CAND - 1)) if LLM_MODE == "lmm" else ([0.2] + [0.7] * (N_CAND - 1))
-    with ThreadPoolExecutor(N_CAND) as ex:
-        futs = [ex.submit(_attempt, msgs, os.path.join(wd, f"c{i}"), plan, temps[i])
-                for i in range(N_CAND)]
-        cands = [f.result() for f in futs]
-    attempts = N_CAND
+    if direct:
+        log("building shape")
+        cands = [_run_code(direct["code"], os.path.join(wd, "c0"), plan)]
+        attempts = 1
+    else:
+        log(f"generating {N_CAND} candidates")
+        temps = ([0.1] + [0.5] * (N_CAND - 1)) if LLM_MODE == "lmm" else ([0.2] + [0.7] * (N_CAND - 1))
+        with ThreadPoolExecutor(N_CAND) as ex:
+            futs = [ex.submit(_attempt, msgs, os.path.join(wd, f"c{i}"), plan, temps[i])
+                    for i in range(N_CAND)]
+            cands = [f.result() for f in futs]
+        attempts = N_CAND
     best = max(cands, key=lambda c: c["score"])
     log(f"best candidate score {best['score']}/10")
 
@@ -511,8 +673,13 @@ def generate(prompt, parent=None, material="Al 6061", log=None, job=None,
     out = {"job": job, "ok": ok, "cached": False, "prompt": prompt, "material": material,
            "plan": plan, "code": best["code"], "score": best["score"],
            "issues": best["issues"], "attempts": attempts,
-           "verified": ok and best["score"] >= 10,
+           "verified": ok and best["score"] >= 10, "route": route,
            "elapsed_s": round(time.time() - t0, 1)}
+    if out["verified"]:
+        out["check_detail"] = ("valid single solid; size / volume match the " +
+                               ("shape you drew" if spec is not None else "build plan")
+                               if best.get("size_checked") else
+                               "valid single solid (its shape was not measured against your request)")
     if ok:
         vol = meta["volume"]
         out.update(bbox=[round(x, 2) for x in meta["bbox"]], volume_mm3=round(vol, 1),
@@ -544,7 +711,7 @@ def generate(prompt, parent=None, material="Al 6061", log=None, job=None,
     # ---- persist for training
     rec = {"job": job, "source": source, "prompt": prompt, "is_edit": bool(parent_code),
            "parent_job": parent, "parent_code": parent_code, "material": material,
-           "plan": plan, "code": best["code"], "ok": ok, "verified": out["verified"],
+           "plan": plan, "code": best["code"], "ok": ok, "verified": out["verified"], "route": route,
            "size_checked": bool(best.get("size_checked")), "score": best["score"],
            "issues": best["issues"], "bbox": out.get("bbox"), "volume_mm3": out.get("volume_mm3"),
            "mass_g": out.get("mass_g"), "n_solids": out.get("n_solids"), "attempts": attempts,
