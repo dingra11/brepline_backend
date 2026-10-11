@@ -25,7 +25,11 @@ CAD_WORKERS = int(os.getenv("CAD_WORKERS", "2"))
 CAD_TIMEOUT = int(os.getenv("CAD_TIMEOUT", "90"))
 CAD_MEM_MB = int(os.getenv("CAD_MEM_MB", "4096"))
 LLM_MODEL = os.getenv("LLM_MODEL", "")
+# "chat" = general instruct model (default). "lmm" = the fine-tuned brepline model, which was
+# trained on one fixed prompt format (see LMM_SYS / SPEC_SHOTS below).
+LLM_MODE = os.getenv("LLM_MODE", "chat").strip().lower()
 FENCE = "`" * 3
+PREFILL = FENCE + "python\n"
 
 os.makedirs(OUT_DIR, exist_ok=True)
 _SEM = threading.Semaphore(CAD_WORKERS)
@@ -63,35 +67,92 @@ PLAN_SYS = """You are a mechanical design planner. Turn the request into a compa
  "notes": "anything ambiguous and the assumption taken"}
 Output JSON only."""
 
+# ---- lmm mode: the exact system prompt and user format the adapter was trained on ----
+LMM_SYS = "You are a Large Mechanical Model. Generate Python CadQuery code for the requested geometry."
+
+SPEC_SYS = """You turn a CAD request into a precise build spec. Reply with ONLY the spec, in exactly the format of the examples.
+Rules: units are millimetres. Sketch planes: XY plane (normal +z) extrudes up; XZ plane (normal -y).
+The first step is "new body"; later steps are "join" or "cut". A hole is a circle in the same sketch as the profile.
+The bounding box must be the true overall size. Use the exact dimensions the request gives; choose realistic ones when missing."""
+
+_H = "Create a CadQuery model with a bounding box of {bb} mm, built from {n} extrusion(s) ({ops}) using {kinds} sketch profiles. Units are millimeters.\nSteps:\n"
+SPEC_SHOTS = [
+    ("washer, 16 mm outer diameter, 8 mm inner diameter, 2 mm thick",
+     _H.format(bb="16.0 x 16.0 x 2.0", n=1, ops="new body", kinds="circle") +
+     "1) new body: sketch on XY plane (normal +z) at z=0.0: circle r=8.0 at (0.00, 0.00, 0.00); "
+     "circle r=4.0 at (0.00, 0.00, 0.00); extrude 2.0 mm"),
+    ("rectangular plate 60 x 40 x 5 mm with two 6 mm holes, 40 mm apart",
+     _H.format(bb="60.0 x 40.0 x 5.0", n=1, ops="new body", kinds="circle and poly") +
+     "1) new body: sketch on XY plane (normal +z) at z=0.0: 4-segment profile, x -30.00..30.00, "
+     "y -20.00..20.00, z=0.00; circle r=3.0 at (-20.00, 0.00, 0.00); circle r=3.0 at (20.00, 0.00, 0.00); "
+     "extrude 5.0 mm"),
+    ("L bracket 60 mm wide, 40 mm base, 40 mm tall, 5 mm thick, two 6 mm mounting holes in the base",
+     _H.format(bb="60.0 x 40.0 x 40.0", n=2, ops="new body, join", kinds="circle and poly") +
+     "1) new body: sketch on XY plane (normal +z) at z=0.0: 4-segment profile, x -30.00..30.00, "
+     "y -20.00..20.00, z=0.00; circle r=3.0 at (-20.00, -5.00, 0.00); circle r=3.0 at (20.00, -5.00, 0.00); "
+     "extrude 5.0 mm\n"
+     "2) join: sketch on XZ plane (normal -y) at y=20.0: 4-segment profile, x -30.00..30.00, "
+     "y=20.00, z 0.00..40.00; extrude 5.0 mm"),
+    ("pipe 30 mm outer diameter, 24 mm inner diameter, 100 mm long",
+     _H.format(bb="30.0 x 30.0 x 100.0", n=1, ops="new body", kinds="circle") +
+     "1) new body: sketch on XY plane (normal +z) at z=0.0: circle r=15.0 at (0.00, 0.00, 0.00); "
+     "circle r=12.0 at (0.00, 0.00, 0.00); extrude 100.0 mm"),
+    ("block 50 x 30 x 20 mm",
+     _H.format(bb="50.0 x 30.0 x 20.0", n=1, ops="new body", kinds="poly") +
+     "1) new body: sketch on XY plane (normal +z) at z=0.0: 4-segment profile, x -25.00..25.00, "
+     "y -15.00..15.00, z=0.00; extrude 20.0 mm"),
+    ("flange 80 mm diameter, 8 mm thick, with a 30 mm diameter hub 20 mm tall and a 12 mm through bore",
+     _H.format(bb="80.0 x 80.0 x 28.0", n=2, ops="new body, join", kinds="circle") +
+     "1) new body: sketch on XY plane (normal +z) at z=0.0: circle r=40.0 at (0.00, 0.00, 0.00); "
+     "circle r=6.0 at (0.00, 0.00, 0.00); extrude 8.0 mm\n"
+     "2) join: sketch on XY plane (normal +z) at z=8.0: circle r=15.0 at (0.00, 0.00, 8.00); "
+     "circle r=6.0 at (0.00, 0.00, 8.00); extrude 20.0 mm"),
+]
+
 
 # ------------------------------------------------------------------ LLM
 
-_client = None
+_clients = {}
 
 
-def llm(messages, temperature=0.2, max_tokens=2500):
-    global _client
+def llm(messages, temperature=0.2, max_tokens=2500, extra_body=None, planner=False):
+    """One chat completion. planner=True uses PLAN_BASE_URL/PLAN_API_KEY/PLAN_MODEL when set
+    (so the planning step can run on a different endpoint than the code model)."""
     from openai import OpenAI
-    if not os.getenv("LLM_API_KEY"):
+    own_planner = planner and bool(os.getenv("PLAN_BASE_URL"))
+    pre = "PLAN_" if own_planner else "LLM_"
+    base = os.getenv(pre + "BASE_URL")
+    key = os.getenv(pre + "API_KEY") or os.getenv("LLM_API_KEY")
+    model = os.getenv(pre + "MODEL") or os.getenv("LLM_MODEL")
+    if not key:
         raise RuntimeError("LLM_API_KEY is not set (load .env before starting the server)")
-    if _client is None:
-        _client = OpenAI(base_url=os.getenv("LLM_BASE_URL"),
-                         api_key=os.getenv("LLM_API_KEY"), timeout=120)
+    if pre not in _clients:
+        _clients[pre] = OpenAI(base_url=base, api_key=key,
+                               timeout=int(os.getenv("LLM_TIMEOUT", "120")))
+    client = _clients[pre]
+    eb = dict(extra_body or {})
+    if LLM_MODE == "lmm":
+        # the fine-tuned model has a fixed output size; reasoning-model padding does not apply
+        if planner and not own_planner:
+            eb["adapter"] = False        # planning is not what the adapter was trained for
+    else:
+        # reasoning models (gpt-oss, qwen3...) spend part of max_tokens on hidden thinking
+        max_tokens = max(max_tokens, int(os.getenv("LLM_MIN_TOKENS", "4000")))
+        if os.getenv("LLM_REASONING_EFFORT"):
+            eb["reasoning_effort"] = os.getenv("LLM_REASONING_EFFORT")
+    extra = {"extra_body": eb} if eb else {}
     last = None
-    # reasoning models (gpt-oss, qwen3...) spend part of max_tokens on hidden thinking
-    max_tokens = max(max_tokens, int(os.getenv("LLM_MIN_TOKENS", "4000")))
-    extra = {}
-    if os.getenv("LLM_REASONING_EFFORT"):
-        extra["extra_body"] = {"reasoning_effort": os.getenv("LLM_REASONING_EFFORT")}
-    for i in range(3):
+    tries = max(1, int(os.getenv("LLM_RETRIES", "3")))
+    for i in range(tries):
         try:
-            r = _client.chat.completions.create(
-                model=os.getenv("LLM_MODEL"), messages=messages,
+            r = client.chat.completions.create(
+                model=model, messages=messages,
                 temperature=temperature, max_tokens=max_tokens, **extra)
             return r.choices[0].message.content or ""
         except Exception as e:
             last = e
-            time.sleep(2 ** i)
+            if i < tries - 1:
+                time.sleep(2 ** i)
     raise RuntimeError(f"LLM call failed: {last}")
 
 
@@ -102,6 +163,15 @@ def extract_code(text):
     if "import cadquery" in text or "result" in text:
         return text.strip() + "\n"
     return ""
+
+
+def extract_spec(text):
+    """Pull the 'Create a CadQuery model ... Steps: ...' spec out of a planner reply."""
+    i = (text or "").find("Create a CadQuery model")
+    if i < 0:
+        return ""
+    s = text[i:].split("<|im_end|>")[0].replace(FENCE, "").strip()
+    return s if "Steps:" in s and "extrude" in s else ""
 
 
 def extract_json(text):
@@ -246,7 +316,8 @@ def evaluate(meta, plan):
         size_checked = True
         got = sorted(meta["bbox"])
         want = sorted(float(x) for x in exp)
-        if any(abs(g - w) / w > 0.25 for g, w in zip(got, want)):
+        tol = 0.05 if LLM_MODE == "lmm" else 0.25
+        if any(abs(g - w) / w > tol for g, w in zip(got, want)):
             score -= 3
             issues.append(f"overall size {[round(x, 1) for x in got]} mm differs from expected {want} mm")
     return max(score, 0), issues, size_checked
@@ -261,6 +332,30 @@ def make_plan(prompt, parent_code=None):
                                  {"role": "user", "content": msg}], 0.1, 600))
     except Exception:
         return {}
+
+
+def make_spec_plan(prompt, parent_prompt=None):
+    """lmm mode: turn the plain-English request into the build spec the adapter was trained on."""
+    req = prompt if not parent_prompt else f"{parent_prompt}. Change: {prompt}"
+    msgs = [{"role": "system", "content": SPEC_SYS}]
+    for q, spec in SPEC_SHOTS:
+        msgs += [{"role": "user", "content": q}, {"role": "assistant", "content": spec}]
+    msgs.append({"role": "user", "content": req})
+    err = ""
+    for temp in (0.1, 0.4):
+        try:
+            spec = extract_spec(llm(msgs, temp, 500, planner=True))
+        except Exception as e:
+            err, spec = str(e), ""
+        if spec:
+            m = re.search(r"bounding box of ([\d.]+) x ([\d.]+) x ([\d.]+) mm", spec)
+            size = [float(g) for g in m.groups()] if m else None
+            return {"object": req[:60], "assembly": False, "overall_size_mm": size, "spec": spec}
+    return {"error": err or "planner produced no valid build spec"}
+
+
+def lmm_msgs(spec):
+    return [{"role": "system", "content": LMM_SYS}, {"role": "user", "content": spec}]
 
 
 def pick_examples(prompt, k=3):
@@ -308,8 +403,15 @@ def load_out(job):
 
 def _attempt(msgs, wd, plan, temp):
     res = {"code": "", "score": 0, "issues": [], "meta": {}, "stage": "llm", "size_checked": False}
+    if msgs is None:
+        res.update(issues=[plan.get("error") or "planner produced no valid build spec"], stage="plan")
+        return res
     try:
-        text = llm(msgs, temp, 2500)
+        if LLM_MODE == "lmm":
+            # the code fence is part of the prompt in the training data, so it is pre-filled
+            text = llm(msgs, temp, 1200, extra_body={"prefill": PREFILL})
+        else:
+            text = llm(msgs, temp, 2500)
     except Exception as e:
         res["issues"] = [str(e)]
         return res
@@ -355,14 +457,25 @@ def generate(prompt, parent=None, material="Al 6061", log=None, job=None,
             return hit, None
 
     log("planning")
-    plan = make_plan(prompt, parent_code)
-    examples = pick_examples(prompt)
-    msgs = base_msgs(prompt, plan, examples, parent_code)
+    if LLM_MODE == "lmm":
+        parent_prompt = None
+        if parent_code:
+            try:
+                parent_prompt = json.load(open(os.path.join(job_dir(parent), "out.json"))).get("prompt")
+            except Exception:
+                pass
+        plan = make_spec_plan(prompt, parent_prompt)
+        examples = []
+        msgs = lmm_msgs(plan["spec"]) if plan.get("spec") else None
+    else:
+        plan = make_plan(prompt, parent_code)
+        examples = pick_examples(prompt)
+        msgs = base_msgs(prompt, plan, examples, parent_code)
 
     log(f"generating {N_CAND} candidates")
     wd = job_dir(job)
     os.makedirs(wd, exist_ok=True)
-    temps = [0.2] + [0.7] * (N_CAND - 1)
+    temps = ([0.1] + [0.5] * (N_CAND - 1)) if LLM_MODE == "lmm" else ([0.2] + [0.7] * (N_CAND - 1))
     with ThreadPoolExecutor(N_CAND) as ex:
         futs = [ex.submit(_attempt, msgs, os.path.join(wd, f"c{i}"), plan, temps[i])
                 for i in range(N_CAND)]
@@ -373,15 +486,20 @@ def generate(prompt, parent=None, material="Al 6061", log=None, job=None,
 
     failures = [dict(c, repaired=False) for c in cands if c["score"] < 10 and c["code"]]
     for r in range(REPAIRS):
-        if best["score"] >= 10:
+        if best["score"] >= 10 or msgs is None:
             break
         log(f"repair round {r + 1}")
         problem = "; ".join(best["issues"]) or "unknown problem"
-        fix = [*msgs,
-               {"role": "assistant", "content": f"{FENCE}python\n{best['code']}{FENCE}"},
-               {"role": "user", "content": f"That code has a problem: {problem}\n"
-                                           f"{hint(problem)}\nReturn the full corrected code."}]
-        c = _attempt(fix, os.path.join(wd, f"r{r}"), plan, 0.2)
+        if LLM_MODE == "lmm":
+            # the adapter never saw repair turns, so retry the same spec with fresh sampling
+            fix, ftemp = msgs, 0.5
+        else:
+            fix = [*msgs,
+                   {"role": "assistant", "content": f"{FENCE}python\n{best['code']}{FENCE}"},
+                   {"role": "user", "content": f"That code has a problem: {problem}\n"
+                                               f"{hint(problem)}\nReturn the full corrected code."}]
+            ftemp = 0.2
+        c = _attempt(fix, os.path.join(wd, f"r{r}"), plan, ftemp)
         attempts += 1
         if c["score"] < 10 and c["code"]:
             failures.append(dict(c, repaired=False))
