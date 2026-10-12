@@ -20,6 +20,7 @@ def load(gpu):
         BASE, device_map={"": gpu},
         quantization_config=BitsAndBytesConfig(
             load_in_4bit=True, bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
             bnb_4bit_compute_dtype=torch.float16))
     if ADAPTER:
         from peft import PeftModel
@@ -114,7 +115,7 @@ def chat(req: Req):
                 do_sample=req.temperature > 0,
                 temperature=max(req.temperature, 0.01),
                 top_p=0.95,
-                repetition_penalty=1.05,
+                repetition_penalty=1.0,
                 eos_token_id=EOS_IDS,
                 pad_token_id=tok.eos_token_id,
                 stopping_criteria=StoppingCriteriaList([DoneCode(start, req.prefill)]),
