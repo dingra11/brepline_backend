@@ -178,9 +178,9 @@ def llm(messages, temperature=0.2, max_tokens=2500, extra_body=None, planner=Fal
                                timeout=int(os.getenv("LLM_TIMEOUT", "120")))
     client = _clients[pre]
     eb = dict(extra_body or {})
-    if LLM_MODE == "lmm":
+    if LLM_MODE == "lmm" and not own_planner:
         # the fine-tuned model has a fixed output size; reasoning-model padding does not apply
-        if planner and not own_planner:
+        if planner:
             eb["adapter"] = False        # planning is not what the adapter was trained for
     else:
         # reasoning models (gpt-oss, qwen3...) spend part of max_tokens on hidden thinking
