@@ -104,21 +104,51 @@ NEW_EXTRACT = '''def extract_spec(text):
     return s if "Steps:" in s and "Base:" in s else ""
 '''
 
+NEW_ROUTE = """# v3 routing: the fine-tuned model now handles plates, text, L-brackets, nuts, bolts, pulleys, shafts, flanges.
+ROUTE_SYS = \"\"\"Classify a CAD request by how the part is best built. Answer with exactly one word.
+REVOLVE = an organic round shape whose profile curves freely along its axis: rocket, vase, bottle, goblet, glass, bell, cone, funnel, chess piece, knob, bullet, dome, lamp base, candle holder.
+POLYGON = a flat part whose outline is a free shape that is not a rectangle, circle or L-bracket: star, arrow, heart, triangle, gusset, pentagon plate, or any shape given as a list of points.
+PRISM = everything else, including plates (with holes, text or engraving), nameplates, anything with letters or text, blocks, washers, rings, tubes, discs, flanges, hex nuts, bolts, standoffs, pins, pulleys, stepped shafts, L-brackets, enclosures, bearing blocks and boxes with pockets.\"\"\"
+ROUTE_SHOTS = [("make a rocket", "REVOLVE"), ("washer, 16 mm outer, 8 mm inner, 2 mm thick", "PRISM"),
+               ("L bracket 60 x 40 mm", "PRISM"), ("plate 100 x 60 x 8 with four corner holes", "PRISM"),
+               ("a vase 120 mm tall", "REVOLVE"), ("6 point star, 50 mm", "POLYGON"),
+               ("a nameplate that says HELLO", "PRISM"), ("hex nut for a 10 mm bolt", "PRISM"),
+               ("V-groove pulley 60 mm", "PRISM"), ("heart shaped pendant, 40 mm", "POLYGON")]
+"""
+
 def patch_cadpipe(path="cadpipe.py"):
     s = open(path).read()
-    if "Overall size:" in s and "Base:" in s and "v3 prompt grammar" in s:
-        print("cadpipe.py already patched"); return
-    shutil.copy(path, path + ".bak")
-    a = s.index('SPEC_SYS = """')
-    b = s.index("# ------------------------------------------------------------------ LLM")
-    s = s[:a] + "# v3 prompt grammar (see make_cad_dataset.py)\n" + NEW_SPEC + "\n\n" + s[b:]
-    a = s.index("def extract_spec(text):")
-    b = s.index("def extract_json(text):")
-    s = s[:a] + NEW_EXTRACT + "\n\n" + s[b:]
-    old = 're.search(r"bounding box of ([\\d.]+) x ([\\d.]+) x ([\\d.]+) mm", spec)'
-    assert old in s, "bbox regex not found"
-    s = s.replace(old, 're.search(r"Overall size:\\s*([\\d.]+) x ([\\d.]+) x ([\\d.]+) mm", spec)')
-    open(path, "w").write(s); print("patched cadpipe.py")
+    orig = s
+    if "v3 prompt grammar" not in s:
+        a = s.index('SPEC_SYS = """')
+        b = s.index("# ------------------------------------------------------------------ LLM")
+        s = s[:a] + "# v3 prompt grammar (see make_cad_dataset.py)\n" + NEW_SPEC + "\n\n" + s[b:]
+        a = s.index("def extract_spec(text):")
+        b = s.index("def extract_json(text):")
+        s = s[:a] + NEW_EXTRACT + "\n\n" + s[b:]
+        old = 're.search(r"bounding box of ([\\d.]+) x ([\\d.]+) x ([\\d.]+) mm", spec)'
+        assert old in s, "bbox regex not found"
+        s = s.replace(old, 're.search(r"Overall size:\\s*([\\d.]+) x ([\\d.]+) x ([\\d.]+) mm", spec)')
+        print("cadpipe.py: v3 grammar patched")
+    # an EXTERNAL planner (PLAN_BASE_URL) may be a reasoning model (gpt-oss, qwen3.x): give it room to think
+    old = ('    if LLM_MODE == "lmm":\n'
+           '        # the fine-tuned model has a fixed output size; reasoning-model padding does not apply\n'
+           '        if planner and not own_planner:\n')
+    new = ('    if LLM_MODE == "lmm" and not own_planner:\n'
+           '        # the fine-tuned model has a fixed output size; reasoning-model padding does not apply\n'
+           '        if planner:\n')
+    if old in s:
+        s = s.replace(old, new); print("cadpipe.py: reasoning-model planner patched")
+    if "# v3 routing" not in s:
+        a = s.index('ROUTE_SYS = """')
+        b = s.index("def route_kind(req):")
+        s = s[:a] + NEW_ROUTE.replace('\\"\\"\\"', '"' * 3) + "\n\n" + s[b:]
+        print("cadpipe.py: routing patched (model keeps plates, text, brackets, nuts, pulleys)")
+    if s != orig:
+        shutil.copy(path, path + ".bak")
+        open(path, "w").write(s)
+    else:
+        print("cadpipe.py already fully patched")
 
 def patch_serve(path="serve_model.py"):
     s = open(path).read()
