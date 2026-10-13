@@ -429,13 +429,16 @@ def make_spec_plan(prompt, parent_prompt=None):
 
 
 # ---- routing: round parts -> revolve builder, outline parts -> polygon builder
+# v3 routing: the fine-tuned model now handles plates, text, L-brackets, nuts, bolts, pulleys, shafts, flanges.
 ROUTE_SYS = """Classify a CAD request by how the part is best built. Answer with exactly one word.
-REVOLVE = a round part whose radius changes along its axis (lathe-turned / spun shape): rocket, vase, bottle, goblet, glass, bell, cone, funnel, chess piece, knob, pulley with a groove, bullet, dome, lamp base, candle holder.
-POLYGON = a flat part cut from an outline that is not a plain rectangle or circle: star, hexagon or pentagon plate, hex nut, arrow, L / T / U / Z shaped bracket or plate, gusset, triangle, or any shape given as a list of points.
-PRISM = everything else: block, plate with holes, washer, ring, tube, flange, spacer, plain cylinder, stepped shaft, box with pockets."""
+REVOLVE = an organic round shape whose profile curves freely along its axis: rocket, vase, bottle, goblet, glass, bell, cone, funnel, chess piece, knob, bullet, dome, lamp base, candle holder.
+POLYGON = a flat part whose outline is a free shape that is not a rectangle, circle or L-bracket: star, arrow, heart, triangle, gusset, pentagon plate, or any shape given as a list of points.
+PRISM = everything else, including plates (with holes, text or engraving), nameplates, anything with letters or text, blocks, washers, rings, tubes, discs, flanges, hex nuts, bolts, standoffs, pins, pulleys, stepped shafts, L-brackets, enclosures, bearing blocks and boxes with pockets."""
 ROUTE_SHOTS = [("make a rocket", "REVOLVE"), ("washer, 16 mm outer, 8 mm inner, 2 mm thick", "PRISM"),
-               ("L bracket 60 x 40 mm", "POLYGON"), ("plate 100 x 60 x 8 with four corner holes", "PRISM"),
-               ("a vase 120 mm tall", "REVOLVE"), ("6 point star, 50 mm", "POLYGON")]
+               ("L bracket 60 x 40 mm", "PRISM"), ("plate 100 x 60 x 8 with four corner holes", "PRISM"),
+               ("a vase 120 mm tall", "REVOLVE"), ("6 point star, 50 mm", "POLYGON"),
+               ("a nameplate that says HELLO", "PRISM"), ("hex nut for a 10 mm bolt", "PRISM"),
+               ("V-groove pulley 60 mm", "PRISM"), ("heart shaped pendant, 40 mm", "POLYGON")]
 
 
 def route_kind(req):
